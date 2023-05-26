@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,7 +17,7 @@ type Authenticator struct {
 	cookies       []*http.Cookie
 	enableCache   bool
 	authenticated bool
-	currentCsrf   string
+	tokCsrf       string
 	appId         string
 	loginNonce    string
 	loggedUser    *InstaUserMin
@@ -32,7 +31,7 @@ func NewAuthenticator(enableCache ...bool) *Authenticator {
 	if len(enableCache) > 0 && enableCache[0] {
 		authy.enableCache = true
 		if authy.IsSessionExists() {
-			if err := authy.LoadSession(); err != nil {
+			if err := authy.loadSession(); err != nil {
 				panic(err)
 			}
 			authy.authenticated = true
@@ -49,21 +48,12 @@ func (a *Authenticator) Do(req *http.Request) (*http.Response, error) {
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.198 Mobile Safari/537.36")
 
-	if a.currentCsrf == "" {
-		for _, cookie := range a.cookies {
-			if cookie.Name == "csrftoken" {
-				a.currentCsrf = cookie.Value
-				break
-			}
-		}
+	if a.tokCsrf == "" {
+		a.tokCsrf = getCookie(a.cookies, "csrftoken")
 	}
 
-	if a.currentCsrf != "" {
-		req.Header.Set("X-Csrftoken", a.currentCsrf)
-	}
-	if a.appId != "" {
-		req.Header.Set("X-Ig-App-Id", a.appId)
-	}
+	req.Header.Set("X-Csrftoken", a.tokCsrf)
+	req.Header.Set("X-Ig-App-Id", a.appId)
 
 	return a.Client.Do(req)
 }
@@ -84,11 +74,10 @@ func (a *Authenticator) Login(username, password string) (*InstaUserMin, error) 
 		return nil, err
 	}
 
-	a.currentCsrf = _csrf
+	a.tokCsrf = _csrf
 
 	req, _ := http.NewRequest("POST", "https://www.instagram.com/api/v1/web/accounts/login/ajax/", strings.NewReader(fmt.Sprintf("username=%s&enc_password=%s&queryParams={}&optIntoOneTap=true", username, a.genEncPassword(password))))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("x-csrftoken", _csrf)
 
 	resp, err := a.Do(req)
 	if err != nil {
@@ -126,13 +115,13 @@ func (a *Authenticator) Login(username, password string) (*InstaUserMin, error) 
 	}
 
 	if !LoggedUser.Authenticated {
-		return nil, fmt.Errorf("login failed: possibly wrong password")
+		return nil, fmt.Errorf("login failed: possibly wrong password/username")
 	}
 
 	a.cookies = resp.Cookies()
 	LoggedUser.AuthenticatedAt = time.Now().Unix()
 	if a.enableCache {
-		if err := a.SaveSession(); err != nil {
+		if err := a.saveSession(); err != nil {
 			return nil, err
 		}
 	}
@@ -193,6 +182,9 @@ func (a *Authenticator) Logout() error {
 	}
 
 	a.cookies = nil
+	a.authenticated = false
+	a.loggedUser = nil
+	a.deleteSession()
 
 	return nil
 }
@@ -205,7 +197,7 @@ func (a *Authenticator) SetCookies(cookies []*http.Cookie) {
 	a.cookies = cookies
 }
 
-func (a *Authenticator) SaveSession() error {
+func (a *Authenticator) saveSession() error {
 	if !a.enableCache {
 		return fmt.Errorf("cache is disabled")
 	}
@@ -242,7 +234,7 @@ func (a *Authenticator) SaveSession() error {
 	return nil
 }
 
-func (a *Authenticator) LoadSession() error {
+func (a *Authenticator) loadSession() error {
 	if !a.enableCache {
 		return fmt.Errorf("cache is disabled")
 	}
@@ -288,7 +280,7 @@ func (a *Authenticator) LoadSession() error {
 	return nil
 }
 
-func (a *Authenticator) DeleteSession() error {
+func (a *Authenticator) deleteSession() error {
 	if !a.enableCache {
 		return fmt.Errorf("cache is disabled")
 	}
@@ -312,57 +304,49 @@ func (a *Authenticator) IsSessionExists() bool {
 	return true
 }
 
-func (a *Authenticator) ExportSession() (string, error) {
-	if !a.enableCache {
-		return "", fmt.Errorf("cache is disabled")
+func (a *Authenticator) exportSession() (string, error) {
+	var exportSess struct {
+		Auth  string `json:"auth,omitempty"`
+		AppId string `json:"app_id,omitempty"`
 	}
 
-	if len(a.cookies) == 0 {
-		return "", fmt.Errorf("no cookies to export")
+	if cook := getCookie(a.cookies, "sessionid"); cook != "" {
+		exportSess.Auth = encodeToBase64(cook)
 	}
 
-	cookies, err := json.Marshal(a.cookies)
+	exportSess.AppId = a.appId
+
+	exported, err := json.Marshal(exportSess)
 	if err != nil {
 		return "", err
 	}
 
-	return encodeToBase64(string(cookies)), nil
+	return encodeToBase64(string(exported)), nil
 }
 
-func (a *Authenticator) ImportSession(session string) error {
-	if !a.enableCache {
-		return fmt.Errorf("cache is disabled")
+func (a *Authenticator) importSession(session string) error {
+	var imported struct {
+		Auth  string `json:"auth,omitempty"`
+		AppId string `json:"app_id,omitempty"`
 	}
 
-	var cookies []*http.Cookie
+	decoded := decodeFromBase64(session)
 
-	if err := json.Unmarshal([]byte(decodeFromBase64(session)), &cookies); err != nil {
+	if err := json.Unmarshal([]byte(decoded), &imported); err != nil {
 		return err
 	}
 
-	a.cookies = cookies
+	if imported.AppId != a.appId && a.appId != "" && imported.AppId != "" {
+		return fmt.Errorf("app id mismatch")
+	}
+
+	a.cookies = append(a.cookies, &http.Cookie{
+		Name:  "sessionid",
+		Value: decodeFromBase64(imported.Auth),
+	})
+
+	a.appId = imported.AppId
 	return nil
-}
-
-func (a *Authenticator) ExportSessionID() (string, error) {
-	for _, cookie := range a.cookies {
-		if cookie.Name == "sessionid" {
-			return cookie.Value, nil
-		}
-	}
-
-	return "", fmt.Errorf("sessionid not found")
-}
-
-func (a *Authenticator) ImportSessionID(sessionID string) error {
-	for _, cookie := range a.cookies {
-		if cookie.Name == "sessionid" {
-			cookie.Value = sessionID
-			return nil
-		}
-	}
-
-	return fmt.Errorf("sessionid not found")
 }
 
 func (a *Authenticator) SetProxy(proxy string) error {
@@ -380,15 +364,6 @@ func (a *Authenticator) SetProxy(proxy string) error {
 	}
 
 	return nil
-}
-
-func encodeToBase64(str string) string {
-	return base64.URLEncoding.Strict().EncodeToString([]byte(str))
-}
-
-func decodeFromBase64(str string) string {
-	decoded, _ := base64.URLEncoding.Strict().DecodeString(str)
-	return string(decoded)
 }
 
 func (a *Authenticator) genEncPassword(password string) string {

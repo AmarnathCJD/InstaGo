@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/PuerkitoBio/goquery"
 )
 
 type Instagram struct {
@@ -15,6 +18,7 @@ type Instagram struct {
 }
 
 type Opts struct {
+	AccessToken string // generated using .GenerateAccessToken()
 	SessionID   string
 	Username    string
 	Password    string
@@ -26,9 +30,10 @@ func NewInsta(opts *Opts) (*Instagram, error) {
 	auth := NewAuthenticator(opts.EnableCache)
 	if opts.SessionID != "" || (opts.Username != "" && opts.Password != "") {
 		if opts.SessionID != "" {
-			if err := auth.ImportSessionID(opts.SessionID); err != nil {
-				return nil, err
-			}
+			auth.cookies = append(auth.cookies, &http.Cookie{
+				Name:  "sessionid",
+				Value: opts.SessionID,
+			})
 			auth.authenticated = true
 		} else {
 			if _, err := auth.Login(opts.Username, opts.Password); err != nil {
@@ -38,11 +43,32 @@ func NewInsta(opts *Opts) (*Instagram, error) {
 	} else if opts.Cookies != nil {
 		auth.cookies = opts.Cookies
 		auth.authenticated = true
+	} else if opts.AccessToken != "" {
+		if err := auth.importSession(opts.AccessToken); err != nil {
+			return nil, err
+		}
+		auth.authenticated = true
+	} else {
+		return nil, fmt.Errorf("either sessionId or username and password or cookies must be provided")
 	}
 
 	return &Instagram{
 		Authenticator: auth,
 	}, nil
+}
+
+// GenerateAccessToken generates an access token from the current session for later use.
+func (i *Instagram) GenerateAccessToken() (string, error) {
+	if !i.Authenticator.authenticated {
+		return "", fmt.Errorf("not authenticated, please login first")
+	}
+
+	return i.Authenticator.exportSession()
+}
+
+// IsAuthenticated returns true if the current session is authenticated.
+func (i *Instagram) IsAuthenticated() bool {
+	return i.Authenticator.authenticated
 }
 
 type InstaUser struct {
@@ -132,6 +158,7 @@ type UserFull struct {
 	ConnectedFbPage any    `json:"connected_fb_page"`
 }
 
+// GetProfile returns the user information of the given username.
 func (i *Instagram) GetProfile(username string) (*UserFull, error) {
 	if !i.Authenticator.authenticated {
 		return nil, fmt.Errorf("not authenticated")
@@ -171,4 +198,90 @@ func (i *Instagram) GetProfile(username string) (*UserFull, error) {
 	}
 
 	return &userRaw.Data.User, nil
+}
+
+// GetProfilePicture returns the profile picture of the given user.
+func (i *Instagram) GetProfilePicture(username string) (string, error) {
+	user, err := i.GetProfile(username)
+	if err != nil {
+		return "", err
+	}
+
+	return user.ProfilePicURLHd, nil
+}
+
+// call the given Api method by passing the logged in user's session
+func (i *Instagram) Raw(req *http.Request) (*http.Response, error) {
+	return i.Authenticator.Do(req)
+}
+
+var (
+	MediaTypePost  = "p"
+	MediaTypeReel  = "reel"
+	MediaTypeStory = "story"
+)
+
+type Media struct {
+	Music struct {
+		ID        string `json:"id"`
+		Thumbnail string `json:"thumbnail"`
+		Title     string `json:"title"`
+		Artist    string `json:"artist"`
+	} `json:"music,omitempty"`
+	Comments int `json:"comments"`
+	Author   struct {
+		ID            string `json:"id"`
+		Username      string `json:"username"`
+		ProfilePicURL string `json:"profile_pic_url"`
+	} `json:"author,omitempty"`
+
+	// TODO: add other fields
+}
+
+// GetMedia returns the media information of the given mediaId/postId/shortcode/URL.
+func (i *Instagram) GetMedia(mediaId string, mediaType ...string) (*Media, error) {
+	if !i.Authenticator.authenticated {
+		return nil, fmt.Errorf("not authenticated")
+	}
+
+	if mediaId == "" {
+		return nil, fmt.Errorf("mediaId is empty")
+	}
+
+	var mediaTypeStr string = MediaTypePost
+	if len(mediaType) > 0 {
+		mediaTypeStr = mediaType[0]
+	}
+
+	actualMedia := genMediaLocation(mediaId, mediaTypeStr)
+	if actualMedia == "" {
+		return nil, fmt.Errorf("invalid mediaId")
+	}
+
+	req, _ := http.NewRequest("GET", actualMedia, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36")
+	for _, cookie := range i.Authenticator.cookies {
+		req.AddCookie(cookie)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("status code error: %d %s", resp.StatusCode, resp.Status)
+	}
+	defer resp.Body.Close()
+
+	// Load the HTML document
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	b, _ := doc.Find("body").Html()
+	if matches := regexp.MustCompile(`{"media":(.*)}`).FindStringSubmatch(b); len(matches) > 0 {
+		ioutil.WriteFile("media.json", []byte(matches[1]), 0644)
+	} // TODO
+
+	return nil, nil
 }
