@@ -19,7 +19,9 @@ type Authenticator struct {
 	enableCache   bool
 	authenticated bool
 	currentCsrf   string
+	appId         string
 	loginNonce    string
+	loggedUser    *InstaUserMin
 }
 
 func NewAuthenticator(enableCache ...bool) *Authenticator {
@@ -29,7 +31,10 @@ func NewAuthenticator(enableCache ...bool) *Authenticator {
 
 	if len(enableCache) > 0 && enableCache[0] {
 		authy.enableCache = true
-		if err := authy.LoadSession(); err == nil {
+		if authy.IsSessionExists() {
+			if err := authy.LoadSession(); err != nil {
+				panic(err)
+			}
 			authy.authenticated = true
 		}
 	}
@@ -43,7 +48,22 @@ func (a *Authenticator) Do(req *http.Request) (*http.Response, error) {
 	}
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.198 Mobile Safari/537.36")
-	req.Header.Set("Accept", "*/*")
+
+	if a.currentCsrf == "" {
+		for _, cookie := range a.cookies {
+			if cookie.Name == "csrftoken" {
+				a.currentCsrf = cookie.Value
+				break
+			}
+		}
+	}
+
+	if a.currentCsrf != "" {
+		req.Header.Set("X-Csrftoken", a.currentCsrf)
+	}
+	if a.appId != "" {
+		req.Header.Set("X-Ig-App-Id", a.appId)
+	}
 
 	return a.Client.Do(req)
 }
@@ -55,6 +75,10 @@ type InstaUserMin struct {
 }
 
 func (a *Authenticator) Login(username, password string) (*InstaUserMin, error) {
+	if a.authenticated {
+		fmt.Println("Already authenticated")
+		return a.loggedUser, nil
+	}
 	_csrf, err := a.getCsrfToken()
 	if err != nil {
 		return nil, err
@@ -113,6 +137,7 @@ func (a *Authenticator) Login(username, password string) (*InstaUserMin, error) 
 		}
 	}
 	a.authenticated = true
+	a.loggedUser = LoggedUser
 
 	return LoggedUser, nil
 }
@@ -201,7 +226,16 @@ func (a *Authenticator) SaveSession() error {
 
 	defer file.Close()
 
-	if _, err := file.WriteString(encodeToBase64(string(cookies))); err != nil {
+	encodedAuth := encodeToBase64(string(cookies))
+	var towrite struct {
+		Auth  string `json:"auth,omitempty"`
+		AppId string `json:"app_id,omitempty"`
+	}
+
+	towrite.Auth = encodedAuth
+	towrite.AppId = a.appId
+
+	if err := json.NewEncoder(file).Encode(towrite); err != nil {
 		return err
 	}
 
@@ -229,9 +263,26 @@ func (a *Authenticator) LoadSession() error {
 		return err
 	}
 
-	if err := json.Unmarshal([]byte(decodeFromBase64(string(undecoded))), &cookies); err != nil {
+	var decoded struct {
+		Auth  string `json:"auth,omitempty"`
+		AppId string `json:"app_id,omitempty"`
+	}
+
+	if err := json.Unmarshal(undecoded, &decoded); err != nil {
 		return err
 	}
+
+	decodedAuth := decodeFromBase64(decoded.Auth)
+
+	if err := json.Unmarshal([]byte(decodedAuth), &cookies); err != nil {
+		return err
+	}
+
+	if decoded.AppId != a.appId && a.appId != "" && decoded.AppId != "" {
+		return fmt.Errorf("app id mismatch")
+	}
+
+	a.appId = decoded.AppId
 
 	a.cookies = cookies
 	return nil
@@ -254,7 +305,7 @@ func (a *Authenticator) IsSessionExists() bool {
 		return false
 	}
 
-	if _, err := os.Stat("session.json"); os.IsNotExist(err) {
+	if _, err := os.Stat("session.session"); os.IsNotExist(err) {
 		return false
 	}
 
@@ -363,6 +414,9 @@ func (a *Authenticator) getCsrfToken() (string, error) {
 
 	csrf_token_raw_ := strings.Replace(string(body), "\\", "", -1)
 	if matches := regexp.MustCompile(`"csrf_token":"(.*?)"`).FindStringSubmatch(csrf_token_raw_); len(matches) > 0 {
+		if matches_ := regexp.MustCompile(`"X-IG-App-ID":"(.*?)"`).FindStringSubmatch(csrf_token_raw_); len(matches_) > 0 {
+			a.appId = matches_[1]
+		}
 		return matches[1], nil
 	}
 
